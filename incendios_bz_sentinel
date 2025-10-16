@@ -1,0 +1,137 @@
+// DETECCION DE CICATRICES DE FUEGO EN BELIZE (ENERO - OCT 2025)
+// VERSION corregida: filtra por <=30% de nube y usa MSK_CLDPRB en vez de QA60
+// Pegar en: https://code.earthengine.google.com/
+
+// 1) AREA: limite BELIZE desde LSIB_SIMPLE
+var countries = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017');
+var belize = countries.filter(ee.Filter.eq('country_na','Belize')).geometry();
+
+// 2) Fechas
+var startDate = '2025-01-01';
+var midDate   = '2025-06-30'; // periodo pre
+var postStart = '2025-07-01';
+var endDate   = '2025-10-31'; // periodo post
+
+// 3) Coleccion Sentinel-2 SR (L2A)
+var s2sr = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')  // limitar a escenas con <= 30% de cobertura de nubes segun metadata
+
+  // limitar a escenas con <= 30% de cobertura de nubes segun metadata
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 30))
+  .filterBounds(belize);
+
+// 4) funcion para enmascarar nubes usando MSK_CLDPRB (valor 0-100) y SCL (opcional)
+function maskCloudsS2(image){
+  // MSK_CLDPRB: probabilidad de nube (0-100). Ajusta umbral segun necesites.
+  var cloudProb = image.select('MSK_CLDPRB');
+  // crear mascara: considerar pixel valido si probabilidad de nube < 40
+  var cloudMask = cloudProb.lt(40);
+
+  // opcional: usar SCL para quitar sombras y nubes clasicas si existe SCL
+  // SCL values: 3 = cloud shadow, 8 = cloud medium prob, 9 = cloud high prob, 10 = thin cirrus
+  var scl = image.select('SCL');
+  var sclMask = scl.neq(3) // eliminar sombras
+               .and(scl.neq(9)) // eliminar nubes altas
+               .and(scl.neq(10)); // eliminar cirros
+  // combinar mascaras (si SCL no existe, la expresion no afecta porque scl sera banda existente en S2_SR)
+  var mask = cloudMask.and(sclMask);
+
+  return image.updateMask(mask);
+}
+
+// 5) funcion para forzar B12 a 10 m (resample) y agregar banda 'B12_10'
+function to10m(image){
+  var b12_10 = image.select('B12')
+    .resample('bilinear')
+    .reproject({crs: image.select('B8').projection(), scale: 10});
+  return image.addBands(b12_10.rename('B12_10'));
+}
+
+// 6) preparar colecciones pre y post, filtrar bounds, mapear enmascarado y reescalar
+var preCol = s2sr
+  .filterDate(startDate, midDate)
+  .map(maskCloudsS2)
+  .map(to10m)
+  .select(['B8','B12_10','B4','B3','B2']); // B8 = NIR, B12_10 ~ SWIR2 a 10m
+
+var postCol = s2sr
+  .filterDate(postStart, endDate)
+  .map(maskCloudsS2)
+  .map(to10m)
+  .select(['B8','B12_10','B4','B3','B2']);
+
+// 7) composites: usar median para reducir nubes/residuos. Se pueden cambiar a mosaic/qualityMosaic si se desea.
+var preMed = preCol.median().clip(belize);
+var postMed = postCol.median().clip(belize);
+
+// 8) calcular NBR y dNBR
+function calcNBR(image){
+  var nir = image.select('B8').toFloat();
+  var swir2 = image.select('B12_10').toFloat();
+  var nbr = nir.subtract(swir2).divide(nir.add(swir2)).rename('NBR');
+  return image.addBands(nbr);
+}
+
+preMed = calcNBR(preMed);
+postMed = calcNBR(postMed);
+
+var dNBR = preMed.select('NBR').subtract(postMed.select('NBR')).rename('dNBR');
+
+// 9) visualizacion
+Map.centerObject(belize,7);
+Map.addLayer(preMed.select('B4','B3','B2'), {min:0, max:3000}, 'Pre RGB Jan-Jun 2025');
+Map.addLayer(postMed.select('B4','B3','B2'), {min:0, max:3000}, 'Post RGB Jul-Oct 2025');
+Map.addLayer(dNBR, {min:-0.5, max:0.7, palette:['white','yellow','orange','red','darkred']}, 'dNBR (pre - post)');
+
+// 10) clasificacion dNBR (umbral orientativo)
+var unburn = dNBR.lt(0.1);
+var low = dNBR.gte(0.1).and(dNBR.lt(0.27));
+var mod = dNBR.gte(0.27).and(dNBR.lt(0.44));
+var modHigh = dNBR.gte(0.44).and(dNBR.lt(0.66));
+var high = dNBR.gte(0.66);
+
+var severity = unburn.multiply(0)
+  .add(low.multiply(1))
+  .add(mod.multiply(2))
+  .add(modHigh.multiply(3))
+  .add(high.multiply(4))
+  .rename('burn_severity');
+
+Map.addLayer(severity.updateMask(severity.neq(0)), {min:1, max:4, palette:['yellow','orange','red','darkred']}, 'Burn severity classes');
+
+// 11) generar mascara quemada (ej: dNBR > 0.27) y filtrar por tamano minimo (~0.5 ha)
+var burnedMask = dNBR.gt(0.27).selfMask(); // mask de quemado
+Map.addLayer(burnedMask, {min:0, max:1, palette:['red']}, 'Burned mask (dNBR>0.27)');
+
+// eliminar parches muy chicos: usar connectedPixelCount para contar pixeles conectados
+var connected = burnedMask.connectedPixelCount(100, true); // ventana 100 pix
+// cada pixel 10x10 = 100 m2; 50 pix = 5000 m2 = 0.5 ha
+var patch = burnedMask.updateMask(connected.gte(50));
+Map.addLayer(patch, {}, 'Burned mask filtered (>~0.5 ha)');
+
+// convertir a vectores (poligonos)
+var vectors = patch.addBands(dNBR).reduceToVectors({
+  geometry: belize,
+  scale: 10,
+  geometryType: 'polygon',
+  eightConnected: true,
+  labelProperty: 'burn',
+  maxPixels: 1e13
+});
+Map.addLayer(vectors, {color:'FF0000'}, 'Burned polygons (>~0.5 ha)');
+
+// 12) exportar vectores y raster dNBR a Drive (ajusta folder/nombre)
+Export.table.toDrive({
+  collection: vectors,
+  description: 'Belize_burned_polygons_2025_JanOct_30pctCloud',
+  folder: 'GEE_outputs',
+  fileFormat: 'GeoJSON'
+});
+
+Export.image.toDrive({
+  image: dNBR.toFloat(),
+  description: 'Belize_dNBR_2025_JanOct_30pctCloud',
+  folder: 'GEE_outputs',
+  scale: 10,
+  region: belize,
+  maxPixels: 1e13
+});
