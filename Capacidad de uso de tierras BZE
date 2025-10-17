@@ -1,0 +1,66 @@
+// -----------------------------------------
+// CAPACIDAD DE USO DE LA TIERRA - SUR DE BELICE
+// Resolución: 20 m
+// Período: Enero 2025 - Septiembre 2025
+// Fuente: Sentinel-2 SR (Harmonized)
+// Clasificación: No supervisada (K-Means)
+// -----------------------------------------
+
+// Importar frontera de Belice
+var belize = ee.FeatureCollection("FAO/GAUL_SIMPLIFIED_500m/2015/level0")
+  .filter(ee.Filter.eq('ADM0_NAME', 'Belize'));
+
+// Crear geometría del sur de Belice (usando un buffer)
+var southBelize = belize.geometry()
+  .intersection(ee.Geometry.Rectangle([-89.2, 15.8, -88.2, 17.0]), ee.ErrorMargin(1000));
+
+// Cargar colección Sentinel-2 SR (nivel de superficie)
+var s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(southBelize)
+  .filterDate('2024-06-01', '2025-09-30')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+  .select(['B2','B3','B4','B8','B11','B12']);
+
+// Reducir la colección a la mediana
+var median = s2.median().clip(southBelize);
+
+// Calcular índices espectrales
+var ndvi = median.normalizedDifference(['B8', 'B4']).rename('NDVI');   // Vegetación
+var ndwi = median.normalizedDifference(['B3', 'B11']).rename('NDWI'); // Agua
+var ndmi = median.normalizedDifference(['B8', 'B11']).rename('NDMI'); // Humedad
+
+// Composición multibanda
+var composite = median.addBands([ndvi, ndwi, ndmi]);
+
+// Muestreo para clasificación (reduce uso de memoria)
+var training = composite.sample({
+  region: southBelize,
+  scale: 20,
+  numPixels: 5000,
+  geometries: false
+});
+
+// Clasificación no supervisada (K-means, 8 clases)
+var clusterer = ee.Clusterer.wekaKMeans(8).train(training);
+var classified = composite.cluster(clusterer);
+
+// Asignar etiquetas (Capacidad de uso I–VIII)
+var labeled = classified.remap(
+  [0,1,2,3,4,5,6,7],
+  [1,2,3,4,5,6,7,8]
+).rename('CapacidadUso');
+
+// Visualización en el mapa
+Map.centerObject(southBelize, 9);
+Map.addLayer(median, {bands:['B4','B3','B2'], min:0, max:3000}, 'RGB Sentinel-2');
+Map.addLayer(labeled.randomVisualizer(), {}, 'Capacidad de uso (I–VIII)');
+
+// Exportar resultado a Google Drive
+Export.image.toDrive({
+  image: labeled,
+  description: 'Capacidad_Uso_Tierra_Sur_Belice_2025',
+  folder: 'GEE_Exports',
+  region: southBelize,
+  scale: 20,
+  maxPixels: 1e13
+});
